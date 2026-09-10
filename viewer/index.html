@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Simple Remote</title>
+  <style>
+    :root {
+      --bg: #0f172a;
+      --line: #334155;
+      --text: #f8fafc;
+      --muted: #cbd5e1;
+    }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at 20% 0, #1e293b, var(--bg));
+      color: var(--text);
+      font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    }
+    .card {
+      width: min(980px, 96vw);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      background: rgba(15, 23, 42, 0.9);
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .toolbar input,
+    .toolbar button {
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      padding: 10px;
+      font-size: 14px;
+    }
+    .toolbar input {
+      background: #0b1220;
+      color: var(--text);
+    }
+    .toolbar button {
+      background: #2563eb;
+      color: #fff;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+    }
+    #statusWrap {
+      margin: 8px 0;
+      color: var(--muted);
+    }
+    #frameWrap {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      background: #000;
+    }
+    #screen {
+      display: block;
+      width: 100%;
+      height: auto;
+    }
+    .hint {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <div class="toolbar">
+      <input id="url" value="ws://127.0.0.1:8765/ws" />
+      <input id="token" placeholder="token (opcional)" />
+      <input id="pairCode" placeholder="código de pareamento (opcional)" />
+      <button id="connect">Conectar</button>
+    </div>
+    <div id="statusWrap">
+      <strong id="status">desconectado</strong>
+    </div>
+    <div id="frameWrap">
+      <img id="screen" alt="Tela remota" />
+    </div>
+    <p class="hint">Não precisa preencher token se você tiver código de pareamento ativo e aprovado pelo host.</p>
+  </main>
+
+  <script>
+    const status = document.getElementById("status");
+    const image = document.getElementById("screen");
+    const btn = document.getElementById("connect");
+    const tokenInput = document.getElementById("token");
+    const urlInput = document.getElementById("url");
+    const pairInput = document.getElementById("pairCode");
+    let ws = null;
+
+    function sleep(ms) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+
+    function send(type, payload = {}) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(JSON.stringify({ type, ...payload }));
+    }
+
+    function setStatus(text) {
+      status.textContent = text;
+    }
+
+    function apiBaseFromWs(wsUrl) {
+      const scheme = wsUrl.protocol === "ws:" ? "http:" : "https:";
+      return `${scheme}//${wsUrl.host}`;
+    }
+
+    async function requestSessionByCode(code, apiBase) {
+      const endpoint = new URL("/pair", apiBase);
+      const response = await fetch(endpoint.toString(), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code })
+      });
+      if (!response.ok) {
+        throw new Error(await response.text());
+      }
+      return response.json();
+    }
+
+    async function waitForApproval(sid, apiBase, timeoutMs = 120000) {
+      const statusUrl = new URL("/session-status", apiBase);
+      statusUrl.searchParams.set("sid", sid);
+      const start = Date.now();
+      while (Date.now() - start < timeoutMs) {
+        const response = await fetch(statusUrl.toString());
+        if (!response.ok) throw new Error("Falha ao consultar aprovação");
+        const payload = await response.json();
+        if (payload.status === "approved") return;
+        if (payload.status === "expired" || payload.status === "not_found") {
+          throw new Error("Sessão não foi aprovada ou expirou");
+        }
+        setStatus("Aguardando aprovação do host...");
+        await sleep(1200);
+      }
+      throw new Error("Tempo esgotado aguardando aprovação");
+    }
+
+    async function connect() {
+      if (ws) ws.close();
+      const token = tokenInput.value.trim();
+      const pairCode = pairInput.value.trim().toUpperCase();
+      const wsBase = new URL(urlInput.value);
+
+      try {
+        if (pairCode) {
+          setStatus("Solicitando pareamento...");
+          const apiBase = apiBaseFromWs(wsBase);
+          const session = await requestSessionByCode(pairCode, apiBase);
+          await waitForApproval(session.sid, apiBase);
+          wsBase.searchParams.set("sid", session.sid);
+        } else if (token) {
+          wsBase.searchParams.set("token", token);
+        } else {
+          setStatus("Informe token ou código de pareamento");
+          return;
+        }
+      } catch (err) {
+        setStatus(`Erro: ${err.message}`);
+        return;
+      }
+
+      ws = new WebSocket(wsBase.toString());
+      setStatus("Conectando...");
+
+      ws.onopen = () => setStatus("Conectado");
+
+      ws.onmessage = (event) => {
+        const msg = JSON.parse(event.data);
+        if (msg.type === "hello") {
+          return;
+        }
+        if (msg.type === "frame") {
+          image.src = "data:image/png;base64," + msg.img;
+        }
+      };
+
+      ws.onclose = () => {
+        setStatus("Desconectado");
+      };
+
+      ws.onerror = () => setStatus("Erro de conexão");
+    }
+
+    btn.addEventListener("click", connect);
+
+    image.addEventListener("mousedown", (event) => {
+      const rect = image.getBoundingClientRect();
+      send("mouse", {
+        type: "mouse",
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+        cw: rect.width,
+        ch: rect.height,
+        action: "down",
+        button: event.button === 2 ? "right" : "left",
+      });
+    });
+    image.addEventListener("mouseup", (event) => {
+      const rect = image.getBoundingClientRect();
+      send("mouse", {
+        type: "mouse",
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+        cw: rect.width,
+        ch: rect.height,
+        action: "up",
+        button: event.button === 2 ? "right" : "left",
+      });
+    });
+    image.addEventListener("mousemove", (event) => {
+      if (event.buttons === 0) return;
+      const rect = image.getBoundingClientRect();
+      send("mouse", {
+        type: "mouse",
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+        cw: rect.width,
+        ch: rect.height,
+        action: "move",
+        button: "left",
+      });
+    });
+    image.addEventListener("wheel", (event) => {
+      const rect = image.getBoundingClientRect();
+      send("mouse", {
+        type: "mouse",
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top,
+        cw: rect.width,
+        ch: rect.height,
+        action: "scroll",
+        dx: event.deltaX,
+        dy: event.deltaY,
+      });
+      event.preventDefault();
+    });
+
+    image.addEventListener("contextmenu", (event) => event.preventDefault());
+
+    image.tabIndex = 0;
+    image.addEventListener("keydown", (event) => {
+      send("key", {
+        type: "key",
+        code: event.key,
+        action: "down",
+      });
+      event.preventDefault();
+    });
+    image.addEventListener("keyup", (event) => {
+      send("key", {
+        type: "key",
+        code: event.key,
+        action: "up",
+      });
+      event.preventDefault();
+    });
+  </script>
+</body>
+</html>
